@@ -1,0 +1,117 @@
+name: Sync Code and Releases
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-all:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Safe Sync Code and Tags
+        run: |
+          UPSTREAM=$(gh api repos/${{ github.repository }} --jq '.parent.full_name' || true)
+          if [ "$UPSTREAM" == "null" ] || [ -z "$UPSTREAM" ]; then exit 0; fi
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch upstream --tags --prune --force
+          
+          echo "开始同步分支..."
+          for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream); do
+            if [ "$branch" == "HEAD" ]; then continue; fi
+            echo "正在处理分支: $branch"
+            
+            # 如果是默认的主分支 (main 或 master)，采用安全合并
+            if [ "$branch" == "main" ] || [ "$branch" == "master" ]; then
+              git checkout "$branch"
+              echo "正在安全合并上游 $branch ..."
+              # 尝试合并，如果遇到冲突就放弃，绝不强推覆盖
+              git merge "upstream/$branch" --no-edit || { echo "合并冲突，跳过代码同步，不影响 Releases"; git merge --abort; }
+              git push origin "$branch" || echo "推送主分支失败，跳过"
+            else
+              # 其他分支直接强推
+              git push origin "refs/remotes/upstream/$branch:refs/heads/$branch" --force || echo "推送分支 $branch 失败，跳过"
+            fi
+          done
+          
+          echo "开始同步 Tags..."
+          git push origin --tags --force || echo "推送 Tags 失败，跳过"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Force Sync Releases with Assets (Keep Latest 10)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM=$(gh api repos/${{ github.repository }} --jq '.parent.full_name' || true)
+          
+          curl -s "https://api.github.com/repos/$UPSTREAM/releases?per_page=10" > releases.json
+          
+          if ! grep -q "tag_name" releases.json; then
+            echo "未找到公开的 Release，可能都是草稿或不存在。"
+            exit 0
+          fi
+          
+          TAGS=$(jq -r '.[].tag_name' releases.json)
+          
+          for TAG in $TAGS; do
+            echo "======================================"
+            echo "正在处理版本: $TAG"
+            
+            if gh release view "$TAG" --repo ${{ github.repository }} > /dev/null 2>&1; then
+              echo "删除本地旧版 $TAG 以强制刷新..."
+              gh release delete "$TAG" --repo ${{ github.repository }} --yes --cleanup-tag || true
+            fi
+            
+            mkdir -p ./assets
+            
+            NAME=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .name" releases.json)
+            BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body" releases.json)
+            echo -e "$NAME\n\n$BODY" > notes.txt
+            
+            DOWNLOAD_URLS=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .assets[].browser_download_url" releases.json)
+            
+            if [ -n "$DOWNLOAD_URLS" ]; then
+              for URL in $DOWNLOAD_URLS; do
+                FILENAME=$(basename "$URL")
+                echo "正在暴力下载: $FILENAME ..."
+                curl -sL -o "./assets/$FILENAME" "$URL" || echo "下载失败，跳过"
+              done
+            fi
+            
+            echo "正在上传到你的仓库..."
+            if [ -z "$(ls -A ./assets)" ]; then
+              gh release create "$TAG" --title "$TAG" --notes-file notes.txt --repo ${{ github.repository }} || true
+            else
+              gh release create "$TAG" --title "$TAG" --notes-file notes.txt ./assets/* --repo ${{ github.repository }} || true
+            fi
+            
+            rm -rf ./assets/*
+            rm -f notes.txt
+          done
+
+          echo "======================================"
+          echo "正在检查并清理旧的 Release..."
+          MY_TAGS=$(gh release list --repo ${{ github.repository }} --json tagName --jq '.[].tagName' 2>/dev/null || true)
+          if [ -n "$MY_TAGS" ]; then
+            COUNT=$(echo "$MY_TAGS" | grep -c . || true)
+            if [ "$COUNT" -gt 10 ]; then
+              TO_DELETE=$(echo "$MY_TAGS" | tail -n +11 || true)
+              for DEL_TAG in $TO_DELETE; do
+                gh release delete "$DEL_TAG" --repo ${{ github.repository }} --yes --cleanup-tag || true
+              done
+            fi
+          fi
