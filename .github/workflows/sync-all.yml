@@ -115,8 +115,9 @@ jobs:
             else
               echo "正在同步 Release: $TAG ..."
               mkdir -p ./assets
-              NAME=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .name" releases.json)
-              BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body" releases.json)
+              NAME=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .name // empty" releases.json)
+              BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body // empty" releases.json)
+              if [ -z "$NAME" ]; then TITLE="$TAG"; else TITLE="$NAME"; fi
               echo -e "$NAME\n\n$BODY" > notes.txt
               
               # 暴力直连下载附件
@@ -127,9 +128,9 @@ jobs:
               done
               
               if [ -z "$(ls -A ./assets)" ]; then
-                gh release create "$TAG" --title "$TAG" --notes-file notes.txt --repo ${{ github.repository }} || true
+                gh release create "$TAG" --title "$TITLE" --notes-file notes.txt --repo ${{ github.repository }} || true
               else
-                gh release create "$TAG" --title "$TAG" --notes-file notes.txt ./assets/* --repo ${{ github.repository }} || true
+                gh release create "$TAG" --title "$TITLE" --notes-file notes.txt ./assets/* --repo ${{ github.repository }} || true
               fi
               rm -rf ./assets/*
               rm -f notes.txt
