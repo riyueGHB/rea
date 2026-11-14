@@ -1,9 +1,10 @@
-name: Sync Code and Releases
+name: Ultimate Safe Sync
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
-  workflow_dispatch:
+    # 每天 UTC 3:15 和 15:15 自动运行（避开整点拥堵）
+    - cron: '15 3,15 * * *'
+  workflow_dispatch:         # 允许手动触发
 
 permissions:
   contents: write
@@ -18,10 +19,15 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Safe Sync Code and Tags
+      - name: Safe Sync Code, Tags and Snapshots
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           UPSTREAM=$(gh api repos/${{ github.repository }} --jq '.parent.full_name' || true)
-          if [ "$UPSTREAM" == "null" ] || [ -z "$UPSTREAM" ]; then exit 0; fi
+          if [ "$UPSTREAM" == "null" ] || [ -z "$UPSTREAM" ]; then 
+            echo "这不是一个 Fork 仓库，退出。"
+            exit 0
+          fi
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -29,88 +35,119 @@ jobs:
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch upstream --tags --prune --force
           
-          echo "开始同步分支..."
-          for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream); do
-            if [ "$branch" == "HEAD" ]; then continue; fi
-            echo "正在处理分支: $branch"
-            
-            # 如果是默认的主分支 (main 或 master)，采用安全合并
-            if [ "$branch" == "main" ] || [ "$branch" == "master" ]; then
-              git checkout "$branch"
-              echo "正在安全合并上游 $branch ..."
-              # 尝试合并，如果遇到冲突就放弃，绝不强推覆盖
-              git merge "upstream/$branch" --no-edit || { echo "合并冲突，跳过代码同步，不影响 Releases"; git merge --abort; }
-              git push origin "$branch" || echo "推送主分支失败，跳过"
-            else
-              # 其他分支直接强推
-              git push origin "refs/remotes/upstream/$branch:refs/heads/$branch" --force || echo "推送分支 $branch 失败，跳过"
-            fi
-          done
+          # ==========================================
+          # 🛡️ 防御机制：防跑路 / 防恶意回退熔断
+          # ==========================================
+          UPSTREAM_COMMITS=$(git rev-list --count upstream/main 2>/dev/null || echo 0)
+          LOCAL_COMMITS=$(git rev-list --count HEAD 2>/dev/null || echo 0)
           
-          echo "开始同步 Tags..."
-          git push origin --tags --force || echo "推送 Tags 失败，跳过"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "源仓库提交数: $UPSTREAM_COMMITS | 本地提交数: $LOCAL_COMMITS"
+          
+          # 如果源仓库提交数暴跌（少于10次），但本地历史很长（大于50次），判定为异常
+          if [ "$UPSTREAM_COMMITS" -lt 10 ] && [ "$LOCAL_COMMITS" -gt 50 ]; then
+            echo "🚨 警告：源仓库代码疑似被清空或恶意回退！已自动拦截代码覆盖，保护本地数据。"
+          else
+            # 源仓库正常，开始安全合并
+            for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream); do
+              if [ "$branch" == "HEAD" ]; then continue; fi
+              
+              if [ "$branch" == "main" ] || [ "$branch" == "master" ]; then
+                git checkout "$branch"
+                # 使用 merge 而不是 force push，保护你的 workflows 文件
+                git merge "upstream/$branch" --no-edit || { echo "合并存在冲突，跳过代码合并"; git merge --abort; }
+                git push origin "$branch" || true
+              else
+                # 其他分支直接强推
+                git push origin "refs/remotes/upstream/$branch:refs/heads/$branch" --force || true
+              fi
+            done
+            git push origin --tags --force || true
+          fi
 
-      - name: Force Sync Releases with Assets (Keep Latest 10)
+          # ==========================================
+          # 📸 快照机制：每天一个，保留最新 5 个
+          # ==========================================
+          echo "检查是否需要打快照..."
+          TODAY=$(date +%Y%m%d)
+          SNAPSHOTS=$(git tag -l "snapshot-*" | sort -r)
+          
+          if ! echo "$SNAPSHOTS" | grep -q "snapshot-$TODAY"; then
+            echo "正在为今天 ($TODAY) 创建快照..."
+            git tag "snapshot-$TODAY"
+            git push origin "snapshot-$TODAY" || true
+            
+            # 重新获取快照列表并清理
+            SNAPSHOTS=$(git tag -l "snapshot-*" | sort -r)
+            SNAPSHOT_COUNT=$(echo "$SNAPSHOTS" | grep -c "snapshot-" || true)
+            
+            if [ "$SNAPSHOT_COUNT" -gt 5 ]; then
+              echo "快照数量超过 5 个，清理旧快照..."
+              TO_DELETE=$(echo "$SNAPSHOTS" | tail -n +6)
+              for OLD_SNAP in $TO_DELETE; do
+                echo "删除旧快照: $OLD_SNAP"
+                git push origin --delete "$OLD_SNAP" || true
+                git tag -d "$OLD_SNAP" || true
+              done
+            fi
+          else
+            echo "今天已经打过快照了，跳过。"
+          fi
+
+      - name: Sync Releases with Assets (Keep Latest 30)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           UPSTREAM=$(gh api repos/${{ github.repository }} --jq '.parent.full_name' || true)
           
-          curl -s "https://api.github.com/repos/$UPSTREAM/releases?per_page=10" > releases.json
+          # 直接抓取原仓库最近的 30 个 Release
+          curl -s "https://api.github.com/repos/$UPSTREAM/releases?per_page=30" > releases.json
           
           if ! grep -q "tag_name" releases.json; then
-            echo "未找到公开的 Release，可能都是草稿或不存在。"
+            echo "未找到公开的 Release。"
             exit 0
           fi
           
           TAGS=$(jq -r '.[].tag_name' releases.json)
           
           for TAG in $TAGS; do
-            echo "======================================"
-            echo "正在处理版本: $TAG"
-            
             if gh release view "$TAG" --repo ${{ github.repository }} > /dev/null 2>&1; then
-              echo "删除本地旧版 $TAG 以强制刷新..."
-              gh release delete "$TAG" --repo ${{ github.repository }} --yes --cleanup-tag || true
-            fi
-            
-            mkdir -p ./assets
-            
-            NAME=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .name" releases.json)
-            BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body" releases.json)
-            echo -e "$NAME\n\n$BODY" > notes.txt
-            
-            DOWNLOAD_URLS=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .assets[].browser_download_url" releases.json)
-            
-            if [ -n "$DOWNLOAD_URLS" ]; then
+              echo "Release $TAG 已存在，跳过。"
+            else
+              echo "正在同步 Release: $TAG ..."
+              mkdir -p ./assets
+              NAME=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .name" releases.json)
+              BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body" releases.json)
+              echo -e "$NAME\n\n$BODY" > notes.txt
+              
+              # 暴力直连下载附件
+              DOWNLOAD_URLS=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .assets[].browser_download_url" releases.json)
               for URL in $DOWNLOAD_URLS; do
                 FILENAME=$(basename "$URL")
-                echo "正在暴力下载: $FILENAME ..."
-                curl -sL -o "./assets/$FILENAME" "$URL" || echo "下载失败，跳过"
+                curl -sL -o "./assets/$FILENAME" "$URL" || true
               done
+              
+              if [ -z "$(ls -A ./assets)" ]; then
+                gh release create "$TAG" --title "$TAG" --notes-file notes.txt --repo ${{ github.repository }} || true
+              else
+                gh release create "$TAG" --title "$TAG" --notes-file notes.txt ./assets/* --repo ${{ github.repository }} || true
+              fi
+              rm -rf ./assets/*
+              rm -f notes.txt
             fi
-            
-            echo "正在上传到你的仓库..."
-            if [ -z "$(ls -A ./assets)" ]; then
-              gh release create "$TAG" --title "$TAG" --notes-file notes.txt --repo ${{ github.repository }} || true
-            else
-              gh release create "$TAG" --title "$TAG" --notes-file notes.txt ./assets/* --repo ${{ github.repository }} || true
-            fi
-            
-            rm -rf ./assets/*
-            rm -f notes.txt
           done
 
-          echo "======================================"
-          echo "正在检查并清理旧的 Release..."
-          MY_TAGS=$(gh release list --repo ${{ github.repository }} --json tagName --jq '.[].tagName' 2>/dev/null || true)
+          # ==========================================
+          # 清理多余的 Release（保留最新 30 个）
+          # ==========================================
+          echo "检查是否需要清理旧 Release..."
+          MY_TAGS=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null || true)
           if [ -n "$MY_TAGS" ]; then
             COUNT=$(echo "$MY_TAGS" | grep -c . || true)
-            if [ "$COUNT" -gt 10 ]; then
-              TO_DELETE=$(echo "$MY_TAGS" | tail -n +11 || true)
+            if [ "$COUNT" -gt 30 ]; then
+              echo "Release 数量超过 30 个，开始清理..."
+              TO_DELETE=$(echo "$MY_TAGS" | tail -n +31)
               for DEL_TAG in $TO_DELETE; do
+                echo "删除旧版本: $DEL_TAG"
                 gh release delete "$DEL_TAG" --repo ${{ github.repository }} --yes --cleanup-tag || true
               done
             fi
