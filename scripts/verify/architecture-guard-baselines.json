@@ -103,7 +103,6 @@
     "src/rust/RustAuditableReader.ts": 1
   },
   "parser-plain-throw": {
-    "src/android/JadxWorkspaceRoot.ts": 4,
     "src/artifacts/DirectoryArtifactReader.ts": 1,
     "src/artifacts/NativeDmgArtifactReader.ts": 1,
     "src/artifacts/ReleaseExposureReader.ts": 1,
@@ -116,8 +115,7 @@
     "src/native/AppleDispatchMetadata.ts": 1,
     "src/native/AppleMachoSelection.ts": 3,
     "src/native/MachoCommandNames.ts": 1,
-    "src/native/NativeMachoInspection.ts": 4,
-    "src/native/pwntools/PwntoolsDecoder.ts": 1
+    "src/native/NativeMachoInspection.ts": 4
   },
   "raw-buffer-read": {
     "src/application/BinaryTargetResolver.ts": 1,
