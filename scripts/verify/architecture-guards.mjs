@@ -11,6 +11,7 @@ import { localCompletenessEnumCount } from "./completeness-enum-guard.mjs";
 import { countKeyedFirstMatches } from "./keyed-first-match.mjs";
 import { budgetArithmeticCount } from "./budget-arithmetic-guard.mjs";
 import { localLimitErrorClassCount } from "./limit-class-guard.mjs";
+import { unmarkedMatchCount } from "./reason-marker.mjs";
 
 // Architecture guards for the strict-identity / best-effort-inference split.
 // - Composite dedup keys must not NUL-join variable-length or free-form
@@ -47,10 +48,14 @@ const stripComments = (content) =>
 
 const sources = await listFiles(join(root, "src"));
 const files = await Promise.all(
-  sources.map(async (path) => ({
-    path: relative(root, path).split(sep).join("/"),
-    content: stripComments(await readFile(path, "utf8")),
-  })),
+  sources.map(async (path) => {
+    const raw = await readFile(path, "utf8");
+    return {
+      path: relative(root, path).split(sep).join("/"),
+      raw,
+      content: stripComments(raw),
+    };
+  }),
 );
 const failures = [];
 const check = (label, selected, pattern, allow = []) => {
@@ -320,7 +325,7 @@ const checkCounted = (label, key, selected, pattern, owners) => {
     if (owners.includes(file.path)) continue;
     const count =
       typeof pattern === "function"
-        ? pattern(file.content)
+        ? pattern(file.content, file)
         : (file.content.match(pattern)?.length ?? 0);
     if (count > 0) counts.set(file.path, count);
   }
@@ -420,12 +425,20 @@ checkCounted(
 
 // A slice to a named maximum drops items; boundedList in src/domain/boundedList
 // keeps the count of what it dropped beside the retained items, so a consumer
-// can say that more exist and how many.
+// can say that more exist and how many. Two caps drop no evidence and carry a
+// reason marker instead (#11411): `// generation-cap: <reason>` limits what REA
+// generates (suggested checks, guards) or the work spent finding it, and
+// `// sample-cap: <reason>` limits illustrative samples whose full totals the
+// same result already reports.
 checkCounted(
-  "slice to a named maximum (use boundedList or BoundedListCollector from src/domain/boundedList so the omitted count travels with the items)",
+  "slice to a named maximum (use boundedList or BoundedListCollector from src/domain/boundedList so the omitted count travels with the items, or mark a generation or sample cap with its reason)",
   "constant-maximum-slice",
   files,
-  /\.slice\(\s*0\s*,\s*[A-Z][A-Z0-9_]*\s*\)/gu,
+  (_content, file) =>
+    unmarkedMatchCount(file.raw, /\.slice\(\s*0\s*,\s*[A-Z][A-Z0-9_]*\s*\)/gu, [
+      "generation-cap",
+      "sample-cap",
+    ]),
   ["src/domain/boundedList.ts"],
 );
 
