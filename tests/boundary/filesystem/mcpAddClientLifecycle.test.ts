@@ -1,4 +1,12 @@
-import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  readFile,
+  rename,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
@@ -8,6 +16,7 @@ import { readClientRegistrationStatuses } from "../../../src/application/ClientR
 import { registerMcpClients } from "../../../src/application/McpClientRegistration.js";
 import { resolveMcpRegistrationClients } from "../../../src/application/McpRegistrationCatalog.js";
 import {
+  clientConfigurationAligned,
   configureClientConfiguration,
   inspectClientConfiguration,
 } from "../../../src/application/SetupClientConfiguration.js";
@@ -19,6 +28,7 @@ import {
 } from "../../../src/application/Uninstall.js";
 import { existingMaintenanceScope } from "../../../src/application/UpdateMaintenance.js";
 import { ArtifactResourceScope } from "../../../src/artifacts/ArtifactResourceScope.js";
+import { OwnedFileHandle } from "../../../src/filesystem/OwnedFileHandle.js";
 import { clearClientLocationEnvironment } from "../../fixtures/clientEnvironment.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 
@@ -175,9 +185,52 @@ it.skipIf(platform === "win32")(
     await expect(
       inspectClientConfiguration(row, {}, command),
     ).resolves.toMatchObject({ status: "update" });
+    // Re-selection after a Hopper install uses the same modes rule.
+    await expect(clientConfigurationAligned(row, {}, command)).resolves.toBe(
+      false,
+    );
     await expect(
       configureClientConfiguration(row, {}, command),
     ).resolves.toMatchObject({ status: "configured" });
     expect(await modes()).toEqual({ directory: 0o700, file: 0o600 });
+    await expect(clientConfigurationAligned(row, {}, command)).resolves.toBe(
+      true,
+    );
+
+    // A linked profile is judged by the folder and file it names.
+    const target = join(home, "fx-profile");
+    await rename(dirname(row.configPath), target);
+    await symlink(target, dirname(row.configPath));
+    await expect(inspectClientConfiguration(row, {}, command)).resolves.toEqual(
+      { status: "already_current" },
+    );
+  },
+);
+
+it.skipIf(platform === "win32")(
+  "setup surfaces the private folder handle it could not close",
+  async () => {
+    const home = await createTestTempDirectory("rea-fx-private-close-");
+    const row = supportedClients(home, platform, {}).find(
+      ({ name }) => name === "fx",
+    );
+    if (row === undefined) throw new Error("fx has no table row");
+    const originalClose = OwnedFileHandle.prototype.close;
+    const close = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockImplementation(async function (this: OwnedFileHandle) {
+        if ((await this.handle.stat()).isDirectory())
+          throw new Error("fixture private directory close denied");
+        return originalClose.call(this);
+      });
+    try {
+      // The failed close keeps its owner on the error instead of becoming a
+      // write failure that drops it.
+      await expect(
+        configureClientConfiguration(row, {}, command),
+      ).rejects.toMatchObject({ cleanupIncomplete: true });
+    } finally {
+      close.mockRestore();
+    }
   },
 );
