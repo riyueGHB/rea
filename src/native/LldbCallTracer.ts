@@ -1,4 +1,5 @@
 import { bindArtifactFileCleanup } from "../artifacts/ArtifactFileOperation.js";
+import { invariantViolation } from "../domain/internalInvariant.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { translateNativeCommandFailure } from "./NativeCommandAnalysisError.js";
 import { DEFAULT_NATIVE_COMMAND_TIMEOUT_MS } from "../domain/native/nativeDeadlines.js";
@@ -1333,7 +1334,9 @@ const releaseLldbRuntime = async (
   owner: RetainedLldbResources,
 ): Promise<void> => {
   if (!owner.processStopped || !owner.targetStopped || owner.files.hasPending)
-    throw new Error("LLDB runtime still owns unresolved child resources");
+    throw invariantViolation(
+      "LLDB runtime still owns unresolved child resources",
+    );
   await owner.rootLease.release();
 };
 
