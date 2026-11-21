@@ -47,11 +47,12 @@ jobs:
               fi
               
               mkdir -p .github/workflows
-              find .github/workflows -type f ! -name "sync-all.yml" -delete || true
+              find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) ! -name "sync-all.yml" | while read -r file; do
+                mv "$file" "${file}.disabled"
+              done
               
               git add .github/workflows/
-              git diff --staged --quiet || git commit -m "Auto cleanup foreign workflows"
-              
+              git diff --staged --quiet || git commit -m "Auto disable foreign workflows"
               git push origin "$branch" || echo "推送 $branch 失败"
             done
             git push origin --tags --force || true
