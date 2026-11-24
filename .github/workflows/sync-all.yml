@@ -2,64 +2,103 @@ name: Ultimate Safe Sync
 
 on:
   schedule:
+    # 每天 UTC 3:15 和 15:15（北京时间 11:15 和 23:15）
     - cron: '15 3,15 * * *'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: ultimate-safe-sync
+  cancel-in-progress: false
+
 jobs:
   sync-all:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout your fork
+      - name: Checkout backup repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream
+        run: |
+          UPSTREAM="morluto/rea"
+          echo "UPSTREAM=$UPSTREAM" >> "$GITHUB_ENV"
 
       - name: Safe Sync Code, Tags and Snapshots
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          UPSTREAM="morluto/rea" 
-          
+          SYNC_FILE=".github/workflows/sync-all.yml"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          
+
+          git remote remove upstream 2>/dev/null || true
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch upstream --tags --prune --force
-          
+
+          # ==========================================
+          # 🛡️ 防御机制：防跑路 / 防恶意回退熔断
+          # ==========================================
           UPSTREAM_COMMITS=$(git rev-list --count upstream/main 2>/dev/null || echo 0)
           LOCAL_COMMITS=$(git rev-list --count HEAD 2>/dev/null || echo 0)
-          
+          echo "源仓库提交数: $UPSTREAM_COMMITS | 本地提交数: $LOCAL_COMMITS"
+
           if [ "$UPSTREAM_COMMITS" -lt 10 ] && [ "$LOCAL_COMMITS" -gt 50 ]; then
             echo "🚨 警告：源仓库代码疑似被清空或恶意回退！已自动拦截代码覆盖。"
           else
             for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream); do
-              if [ "$branch" == "HEAD" ]; then continue; fi
-              
-              if git show-ref --verify --quiet refs/heads/$branch; then
+              if [ "$branch" = "HEAD" ]; then continue; fi
+
+              if git show-ref --verify --quiet "refs/heads/$branch"; then
                 git checkout "$branch"
-                git merge "upstream/$branch" --no-edit -m "Sync with upstream $branch" || { echo "冲突，保留本地"; git merge --abort; }
+                OLD_HEAD=$(git rev-parse HEAD)
+                # 有共同历史 -> 普通合并；无共同历史（打包上传/网页新建的仓库）-> 镜像重置，并保住本工作流
+                if [ -n "$(git merge-base HEAD "upstream/$branch" 2>/dev/null)" ]; then
+                  if ! git merge "upstream/$branch" --no-edit -m "Sync with upstream $branch" >/dev/null 2>&1; then
+                    # 上游改了我们已删除的 workflow 时会冲突；只要冲突全在 .github/workflows/，
+                    # 就按「本地删除」解决，代码照常同步
+                    CONFLICTS=$(git diff --name-only --diff-filter=U)
+                    OTHER=$(echo "$CONFLICTS" | grep -v '^\.github/workflows/' || true)
+                    if [ -n "$OTHER" ]; then
+                      echo "冲突，保留本地：$OTHER"
+                      git merge --abort
+                      continue
+                    fi
+                    for f in $CONFLICTS; do git rm -f "$f" >/dev/null 2>&1 || true; done
+                    git commit --no-edit -m "Sync with upstream $branch" >/dev/null
+                  fi
+                  # 只同步代码，不同步 .github/workflows：恢复成 merge 前的样子并并入提交。
+                  # 提交里因此不含任何 workflow 变更，GITHUB_TOKEN 不会被权限拦截。
+                  git checkout "$OLD_HEAD" -- .github/workflows/ 2>/dev/null || true
+                  git ls-files .github/workflows/ | while IFS= read -r f; do
+                    git cat-file -e "$OLD_HEAD:$f" 2>/dev/null || { git rm -f --cached "$f" >/dev/null 2>&1; rm -f "$f"; }
+                  done
+                  git diff --cached --quiet || git commit --amend --no-edit --quiet
+                else
+                  echo "检测到无关历史（打包上传的仓库），按镜像方式重置 $branch"
+                  cp "$SYNC_FILE" /tmp/sync-all.yml 2>/dev/null || true
+                  git reset --hard "upstream/$branch"
+                  mkdir -p .github/workflows
+                  cp /tmp/sync-all.yml "$SYNC_FILE" 2>/dev/null || true
+                fi
               else
                 git checkout -b "$branch" "upstream/$branch"
               fi
-              
-              mkdir -p .github/workflows
-              find .github/workflows -type f \( -name "*.yml" -o -name "*.yaml" \) ! -name "sync-all.yml" | while read -r file; do
-                mv "$file" "${file}.disabled"
-              done
-              
-              git add .github/workflows/
-              git diff --staged --quiet || git commit -m "Auto disable foreign workflows"
-              git push origin "$branch" || echo "推送 $branch 失败"
+
+              git push origin "$branch" --force || { echo "::error::推送 $branch 失败"; exit 1; }
             done
             git push origin --tags --force || true
           fi
 
-          git checkout main || git checkout master || true
+          DEFAULT_BRANCH=$(gh api "repos/${{ github.repository }}" --jq '.default_branch' 2>/dev/null || echo main)
+          git checkout "$DEFAULT_BRANCH" || git checkout main || git checkout master || true
 
+          # ==========================================
+          # 📸 快照机制：每天一个，保留最新 5 个
+          # ==========================================
           TODAY=$(date +%Y%m%d)
           SNAPSHOTS=$(git tag -l "snapshot-*" | sort -r)
           if ! echo "$SNAPSHOTS" | grep -q "snapshot-$TODAY"; then
@@ -80,10 +119,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          UPSTREAM="morluto/rea"
           curl -s "https://api.github.com/repos/$UPSTREAM/releases?per_page=30" > releases.json
-          if ! grep -q "tag_name" releases.json; then exit 0; fi
-          
+          if ! grep -q "tag_name" releases.json; then
+            echo "未找到公开的 Release。"
+            exit 0
+          fi
+
           TAGS=$(jq -r '.[].tag_name' releases.json)
           for TAG in $TAGS; do
             if gh release view "$TAG" --repo ${{ github.repository }} > /dev/null 2>&1; then
@@ -94,13 +135,13 @@ jobs:
               BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body // empty" releases.json)
               if [ -z "$NAME" ]; then TITLE="$TAG"; else TITLE="$NAME"; fi
               echo -e "$NAME\n\n$BODY" > notes.txt
-              
+
               DOWNLOAD_URLS=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .assets[].browser_download_url" releases.json)
               for URL in $DOWNLOAD_URLS; do
                 FILENAME=$(basename "$URL")
                 curl -sL -o "./assets/$FILENAME" "$URL" || true
               done
-              
+
               if [ -z "$(ls -A ./assets)" ]; then
                 gh release create "$TAG" --title "$TITLE" --notes-file notes.txt --repo ${{ github.repository }} || true
               else
