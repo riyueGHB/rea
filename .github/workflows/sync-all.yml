@@ -9,6 +9,7 @@ on:
 permissions:
   contents: write
 
+# 同一时间只允许一个同步任务，避免两次改动互相打架
 concurrency:
   group: ultimate-safe-sync
   cancel-in-progress: false
@@ -16,16 +17,15 @@ concurrency:
 jobs:
   sync-all:
     runs-on: ubuntu-latest
+    env:
+      # ⚠️ 唯一需要改的地方：改成这个仓库对应的源仓库
+      UPSTREAM: "morluto/rea"
     steps:
       - name: Checkout backup repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Resolve upstream
-        run: |
-          UPSTREAM="morluto/rea"
-          echo "UPSTREAM=$UPSTREAM" >> "$GITHUB_ENV"
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Safe Sync Code, Tags and Snapshots
         env:
@@ -35,6 +35,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # 独立仓库没有 parent，UPSTREAM 直接用手写的值
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch upstream --tags --prune --force
@@ -49,6 +50,7 @@ jobs:
           if [ "$UPSTREAM_COMMITS" -lt 10 ] && [ "$LOCAL_COMMITS" -gt 50 ]; then
             echo "🚨 警告：源仓库代码疑似被清空或恶意回退！已自动拦截代码覆盖。"
           else
+            DEFAULT_BRANCH=$(gh api "repos/${{ github.repository }}" --jq '.default_branch' 2>/dev/null || echo main)
             for branch in $(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream); do
               if [ "$branch" = "HEAD" ]; then continue; fi
 
@@ -85,10 +87,15 @@ jobs:
                   cp /tmp/sync-all.yml "$SYNC_FILE" 2>/dev/null || true
                 fi
               else
+                # 本地还没有这个分支：直接建出来（内容就是上游）
                 git checkout -b "$branch" "upstream/$branch"
               fi
 
-              git push origin "$branch" --force || { echo "::error::推送 $branch 失败"; exit 1; }
+              if ! git push origin "$branch" --force; then
+                echo "::warning::分支 $branch 推送失败（该分支自己改过 .github/workflows），本次跳过"
+                git checkout "$DEFAULT_BRANCH" 2>/dev/null || true
+                continue
+              fi
             done
             git push origin --tags --force || true
           fi
@@ -131,6 +138,7 @@ jobs:
               echo "Release $TAG 已存在。"
             else
               mkdir -p ./assets
+              # 完美还原标题
               NAME=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .name // empty" releases.json)
               BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body // empty" releases.json)
               if [ -z "$NAME" ]; then TITLE="$TAG"; else TITLE="$NAME"; fi
@@ -151,6 +159,7 @@ jobs:
             fi
           done
 
+          # 清理多余的 Release（保留最新 30 个）
           MY_TAGS=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null || true)
           if [ -n "$MY_TAGS" ]; then
             COUNT=$(echo "$MY_TAGS" | grep -c . || true)
