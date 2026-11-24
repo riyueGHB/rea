@@ -1,9 +1,10 @@
+import type { WorkflowAnalysisPort } from "../WorkflowEvidence.js";
 import { ExportPublishedCleanupFailure } from "./exportResources.js";
 import { join } from "node:path";
 import { z } from "zod";
 import type { PseudocodeAbsence } from "../../domain/native/pseudocodeAbsence.js";
 
-import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
+import { ArtifactReaderFailure } from "../../resources/index.js";
 
 import {
   DECOMPILE_DIRECTORY_INDEX_NAME,
@@ -19,18 +20,21 @@ import { digestSchema } from "../../domain/digests.js";
 import type {
   AnalysisExecution,
   AnalysisOperationPort,
-} from "../AnalysisProvider.js";
+} from "../../ports/AnalysisProvider.js";
 import {
   AnalysisCancelledError,
   AnalysisCapabilityUnavailableError,
   AnalysisOutputError,
   AnalysisTimeoutError,
+  isAborted,
+  cancelledBy,
 } from "../../domain/analysisErrorCore.js";
 import type { AnalysisError } from "../../domain/analysisErrorBase.js";
-import { analysisErrorWithCleanupFailure } from "../../domain/analysisErrorCleanup.js";
+import { analysisErrorWithCleanupDependencies } from "../../domain/analysisErrorCleanup.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
 import { procedureInfoSchema } from "../../domain/native/procedureInfo.js";
-import { addressedValueSchema } from "../../domain/native/nativeInventory.js";
+import { listProceduresFact } from "../../domain/native/nativeOperationFacts.js";
+import { executeFact } from "../AnalysisOperationFacts.js";
 import { addressCoordinate } from "../../domain/native/addressCoordinate.js";
 import type { JsonValue } from "../../domain/jsonValue.js";
 import { err, ok, type Result } from "../../domain/result.js";
@@ -108,7 +112,7 @@ interface PublishState {
  * caller cancels.
  */
 export const decompileAll = async (
-  analysis: AnalysisOperationPort,
+  analysis: WorkflowAnalysisPort,
   input: DecompileDirectoryInput,
   signal?: AbortSignal,
 ): Promise<Result<JsonValue, AnalysisError>> => {
@@ -119,10 +123,10 @@ export const decompileAll = async (
     input.resume,
   );
   if (!placement.ok) return placement;
-  if (isAborted(signal)) return err(cancelled(signal));
+  if (isAborted(signal)) return err(cancelledBy("decompile_all", signal));
   const loaded = await loadProcedures(analysis, input.layout, signal);
   if (!loaded.ok) return loaded;
-  if (isAborted(signal)) return err(cancelled(signal));
+  if (isAborted(signal)) return err(cancelledBy("decompile_all", signal));
   const selection = selectProcedures(
     loaded.value.procedures,
     input,
@@ -225,7 +229,7 @@ export const decompileAll = async (
         primary.cause === signal?.reason
       )
     )
-      primary.retainSecondaryFailure(cancelled(signal));
+      primary.retainSecondaryFailure(cancelledBy("decompile_all", signal));
     for (const failure of failures.slice(1))
       primary.retainSecondaryFailure(failure);
     if (
@@ -233,11 +237,11 @@ export const decompileAll = async (
       primary !== closed.error &&
       closed.error.cleanupIncomplete
     ) {
-      failure = analysisErrorWithCleanupFailure(
+      failure = analysisErrorWithCleanupDependencies(
         primary,
         closed.error,
         "decompile_all",
-      ).bindCleanupDependencies([primary, closed.error]);
+      );
     }
     if (publishedOutput !== undefined)
       failure.retainPrimaryDiagnostics({ published_output: publishedOutput });
@@ -247,7 +251,7 @@ export const decompileAll = async (
   // resume, but a caller abort that stopped the loop or arrived meanwhile is
   // not a success. Report it with the caller's own reason.
   if (isAborted(signal)) {
-    const failure = cancelled(signal);
+    const failure = cancelledBy("decompile_all", signal);
     if (publishedOutput !== undefined)
       failure.retainPrimaryDiagnostics({ published_output: publishedOutput });
     return err(failure);
@@ -305,32 +309,27 @@ const loadProcedures = async (
     AnalysisError
   >
 > => {
-  const observed = await analysis.execute(
-    "list_procedures",
+  const inventory = await executeFact(
+    analysis,
+    listProceduresFact,
     {},
     executionOptions(signal),
   );
-  if (!observed.ok) return observed;
-  const parsed = z.array(addressedValueSchema).safeParse(observed.value.result);
-  if (!parsed.success)
-    return err(
-      new AnalysisOutputError(
-        "list_procedures",
-        "provider returned an invalid procedure inventory",
-      ),
-    );
-  const identity = identityFrom(observed.value, layout);
+  if (!inventory.ok) return inventory;
+  const identity = identityFrom(inventory.value.execution, layout);
   if (!identity.ok) return identity;
   // An empty address cannot name a file or a journal record.
-  const addressed = parsed.data.filter((row) => row.address.length > 0);
+  const addressed = inventory.value.fact.filter(
+    (row) => row.address.length > 0,
+  );
   return ok({
     procedures: addressed.map((row) => ({
       address: row.address,
       name: row.value.length === 0 ? null : row.value,
     })),
     identity: identity.value,
-    unaddressed: parsed.data.length - addressed.length,
-    limitations: observed.value.limitations,
+    unaddressed: inventory.value.fact.length - addressed.length,
+    limitations: inventory.value.execution.limitations,
   });
 };
 
@@ -382,7 +381,7 @@ const identityFrom = (
 };
 
 interface PublishInput {
-  readonly analysis: AnalysisOperationPort;
+  readonly analysis: WorkflowAnalysisPort;
   readonly session: DecompileExport;
   readonly procedures: readonly SelectedProcedure[];
   readonly identity: ExportIdentity;
@@ -397,14 +396,16 @@ const publishSelected = async (
 ): Promise<Result<void, AnalysisError>> => {
   let bodySupport: "unknown" | "unavailable" = "unknown";
   for (const procedure of input.procedures) {
-    if (isAborted(input.signal)) return err(cancelled(input.signal));
+    if (isAborted(input.signal))
+      return err(cancelledBy("decompile_all", input.signal));
     const existing = await existingFile(
       input.session,
       procedure.address,
       input.signal,
     );
     if (typeof existing === "object") return err(existing.error);
-    if (isAborted(input.signal)) return err(cancelled(input.signal));
+    if (isAborted(input.signal))
+      return err(cancelledBy("decompile_all", input.signal));
     if (existing === "skip") {
       input.state.skipped += 1;
       // A file that reads back and verifies shows the directory works.
@@ -506,7 +507,7 @@ const attemptOne = async (
 };
 
 const publishOne = async (input: {
-  readonly analysis: AnalysisOperationPort;
+  readonly analysis: WorkflowAnalysisPort;
   readonly session: DecompileExport;
   readonly procedure: SelectedProcedure;
   readonly identity: ExportIdentity;
@@ -561,6 +562,7 @@ const publishOne = async (input: {
     observationMismatch(input.identity, decompiled.value) === undefined
   ) {
     const original = decompiled.value;
+    input.analysis.recordItemLimitations?.("procedure_pseudo_code", original);
     const originalSource: NonNullable<
       DecompileDirectoryFunctionRecord["provider_source"]
     > =
@@ -577,7 +579,7 @@ const publishOne = async (input: {
     if (!recorded.ok) return { result: recorded, bodySupport: body.support };
     if (isAborted(input.signal))
       return {
-        result: err(cancelled(input.signal)),
+        result: err(cancelledBy("decompile_all", input.signal)),
         bodySupport: body.support,
       };
     attemptedIndependent = true;
@@ -616,6 +618,10 @@ const publishOne = async (input: {
       bodySupport: body.support,
     };
   }
+  input.analysis.recordItemLimitations?.(
+    "procedure_pseudo_code",
+    decompiled.value,
+  );
   const caveats = [
     ...new Set([
       ...infoCaveats,
@@ -645,7 +651,7 @@ const publishOne = async (input: {
         ? {
             code: "no_pseudocode",
             message:
-              "The provider reported a function decompilation failure. If it supports independent decompilation, resume this export with retry_failed: independent_fresh (CLI: --resume --retry-failed independent_fresh). The retry may use different analysis context.",
+              "The provider reported a function decompilation failure. If it supports independent decompilation, resume this export with retry_failed: independent_fresh. The retry may use different analysis context.",
           }
         : pseudocodeFailure(pseudocode);
     recordFailure(
@@ -670,7 +676,10 @@ const publishOne = async (input: {
   // Classify and journal settled failures before a later caller abort. A valid
   // result still needs an active caller before publishing a new function file.
   if (isAborted(input.signal))
-    return { result: err(cancelled(input.signal)), bodySupport: body.support };
+    return {
+      result: err(cancelledBy("decompile_all", input.signal)),
+      bodySupport: body.support,
+    };
   const relativePath = input.session.pathFor(input.procedure.address);
   const bytes = Buffer.from(
     functionFileText({
@@ -731,7 +740,7 @@ const publishOne = async (input: {
 };
 
 const readBody = async (
-  analysis: AnalysisOperationPort,
+  analysis: WorkflowAnalysisPort,
   address: string,
   identity: ExportIdentity,
   signal: AbortSignal | undefined,
@@ -743,8 +752,8 @@ const readBody = async (
       readonly support: "unknown" | "unavailable";
       /**
        * Caveats of a procedure_info observation for this export's target and
-       * profile. An observation for another target or profile is foreign and
-       * contributes none.
+       * profile. An observation for another target or profile, or with a
+       * validated different entry point, contributes no caveats.
        */
       readonly limitations?: readonly string[];
       /**
@@ -797,19 +806,19 @@ const readBody = async (
       support,
     };
   const parsed = procedureInfoSchema.safeParse(observed.value.result);
-  if (!parsed.success)
-    return {
-      kind: "body",
-      fact: unavailableBody("procedure_info returned an invalid body."),
-      support,
-      limitations: observed.value.limitations,
-    };
-  if (!sameAddress(parsed.data.entrypoint, address))
+  if (parsed.success && !sameAddress(parsed.data.entrypoint, address))
     return {
       kind: "body",
       fact: unavailableBody(
         "procedure_info described a different entry point than this function.",
       ),
+      support,
+    };
+  analysis.recordItemLimitations?.("procedure_info", observed.value);
+  if (!parsed.success)
+    return {
+      kind: "body",
+      fact: unavailableBody("procedure_info returned an invalid body."),
       support,
       limitations: observed.value.limitations,
     };
@@ -1165,12 +1174,6 @@ const executionOptions = (signal: AbortSignal | undefined) => ({
   ...(signal === undefined ? {} : { signal }),
   selectorOrigin: "provider" as const,
 });
-
-const cancelled = (signal: AbortSignal | undefined): AnalysisCancelledError =>
-  new AnalysisCancelledError("decompile_all", { cause: signal?.reason });
-
-const isAborted = (signal: AbortSignal | undefined): boolean =>
-  signal?.aborted === true;
 
 const nodeAbsent = (cause: unknown): boolean =>
   typeof cause === "object" &&

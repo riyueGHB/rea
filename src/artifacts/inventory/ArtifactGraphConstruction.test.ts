@@ -14,9 +14,8 @@ import {
   resolveOccurrenceParents,
 } from "./ArtifactGraphConstruction.js";
 import { createArtifactClassificationProbe } from "../ArtifactClassificationProbe.js";
-import { createAsarHeaderSignatureProbe } from "../AsarHeader.js";
-import { ArtifactReaderFailure } from "../ArtifactReader.js";
-import { translateArtifactFailure } from "../ArtifactOperationFailure.js";
+import { ArtifactReaderFailure } from "../../resources/ArtifactReader.js";
+import { translateArtifactFailure } from "../../resources/index.js";
 import { projectAnalysisError } from "../../domain/analysisErrorProjection.js";
 import { artifactIdForContent } from "../../domain/artifactIdentity.js";
 import { pe } from "../../domain/binaryTarget.fixture.js";
@@ -25,7 +24,7 @@ import {
   minimalElfImage,
   minimalMachoImage,
 } from "../../../tests/fixtures/nativeHeaders.js";
-import type { ArtifactEntry } from "../ArtifactReader.js";
+import type { ArtifactEntry } from "../../resources/ArtifactReader.js";
 import { dfuseFile } from "../../domain/firmware/dfuse.fixture.js";
 import {
   RP2040_FAMILY,
@@ -41,7 +40,7 @@ import {
   esp8266Image,
   espImage,
 } from "../../../tests/fixtures/espImage.js";
-import { devicetreeFixture } from "../../firmware/devicetree/Devicetree.fixture.js";
+import { devicetreeFixture } from "../../domain/firmware/devicetree.fixture.js";
 import { fitFixture } from "../fit/FitImage.fixture.js";
 
 it("joins only observed PE signature bytes across stream chunks", () => {
@@ -63,6 +62,21 @@ it("joins only observed PE signature bytes across stream chunks", () => {
     offset: 8190,
     bytes: Buffer.from([0x50, 0x45, 0, 0]),
   });
+  expect(
+    classifyArtifactContent("native.exe", complete, bytes.length).format,
+  ).toBe("pe");
+});
+
+it("retains a PE record whose optional header crosses the retained prefix", () => {
+  const bytes = pe(0x8664, 8_000);
+  const probe = createArtifactClassificationProbe();
+  probe.write(bytes.subarray(0, 8_192));
+  const partial = probe.finish(bytes.length);
+  expect(
+    classifyArtifactContent("native.exe", partial, bytes.length).format,
+  ).toBe("unknown");
+  probe.write(bytes.subarray(8_192));
+  const complete = probe.finish(bytes.length);
   expect(
     classifyArtifactContent("native.exe", complete, bytes.length).format,
   ).toBe("pe");
@@ -127,24 +141,20 @@ describe("native header admission", () => {
 it("projects the parsed ASAR header size when admission rejects an archive", () => {
   const bytes = asarHeaderBytes("{}", { padding: Buffer.alloc(8, 0x20) });
   const headerBytes = bytes.readUInt32LE(4);
-  const probe = createAsarHeaderSignatureProbe({
+  const probe = createArtifactClassificationProbe({
     maximumBytes: headerBytes - 1,
     source: "setting",
   });
   probe.write(bytes);
-  const asarHeader = probe.finish(bytes.length);
-  expect(asarHeader).toMatchObject({
+  const evidence = probe.finish(bytes.length);
+  expect(evidence.asarHeader).toMatchObject({
     state: "limit",
     extents: { headerBytes },
   });
 
   let failure: unknown;
   try {
-    classifyArtifactContent(
-      "app.asar",
-      { prefix: bytes, asarHeader },
-      bytes.length,
-    );
+    classifyArtifactContent("app.asar", evidence, bytes.length);
   } catch (cause) {
     failure = cause;
   }
@@ -550,6 +560,7 @@ it("keeps byte content format separate from path-specific package role", () => {
     kind: "container",
     format: "apk",
     contentFormat: "zip",
+    contentArchitecture: null,
   });
 });
 
@@ -663,15 +674,18 @@ it("classifies a FIT by a /images node within the first 4 KiB", () => {
       kind: "container",
       format: "fit",
     });
-  for (const bytes of [
-    devicetreeFixture(),
-    fitFixture({ images, version: 15 }),
-    late,
-  ])
+  for (const bytes of [devicetreeFixture(), late])
     expect(classifyArtifactBytesAtPath("firmware/board.dtb", bytes)).toEqual({
       kind: "resource",
-      format: "file",
+      format: "devicetree",
     });
+  // The devicetree header owner refuses FDT v15, so those bytes stay a file.
+  expect(
+    classifyArtifactBytesAtPath(
+      "firmware/board.dtb",
+      fitFixture({ images, version: 15 }),
+    ),
+  ).toEqual({ kind: "resource", format: "file" });
 });
 
 describe("FAT prefix observation coverage", () => {
@@ -698,12 +712,9 @@ describe("FAT prefix observation coverage", () => {
     probe.write(bytes.subarray(0, 8_192));
     const evidence = probe.finish(bytes.length);
 
-    expect(
-      evidence.fatSliceHeaders?.sliceHeadersByOffset.get(4_096)?.magic,
-    ).toBe(0xcffaedfe);
-    expect(evidence.fatSliceHeaders?.sliceHeadersByOffset.has(8_192)).toBe(
-      false,
-    );
+    expect(evidence.fatHeader.state).toBe("parsed");
+    expect(evidence.fatSliceHeadersByOffset.get(4_096)?.magic).toBe(0xcffaedfe);
+    expect(evidence.fatSliceHeadersByOffset.has(8_192)).toBe(false);
   });
 });
 
@@ -718,6 +729,26 @@ describe("bounded FAT inventory classification", () => {
       });
     },
   );
+});
+
+it("classifies a streamed XML plist whose prolog passes the retained prefix", () => {
+  const prolog = `<?xml version="1.0"?><!--${" ".repeat(9_000)}-->`;
+  const probe = createArtifactClassificationProbe();
+  const plist = Buffer.from(`${prolog}<plist version="1.0"><dict/></plist>`);
+  for (let offset = 0; offset < plist.length; offset += 4_096)
+    probe.write(plist.subarray(offset, offset + 4_096));
+  const evidence = probe.finish(plist.length);
+  expect(evidence.xmlPlistSignature).toBe(true);
+  expect(
+    classifyArtifactContent("state.archive", evidence, plist.length),
+  ).toMatchObject({
+    kind: "plist",
+    format: "plist",
+  });
+  const other = createArtifactClassificationProbe();
+  const root = Buffer.from(`${prolog}<root><plist/></root>`);
+  other.write(root);
+  expect(other.finish(root.length).xmlPlistSignature).toBe(false);
 });
 
 it("preserves path-selected inventory roles for XML content", () => {

@@ -34,12 +34,14 @@ import type {
   AnalysisExecution,
   AnalysisOperation,
   RetainedResourceScope,
-} from "../AnalysisProvider.js";
+} from "../../ports/AnalysisProvider.js";
 import { AnalysisSnapshotCache } from "./AnalysisSnapshotCache.js";
 import { InvestigationRecords } from "../investigation/InvestigationRecords.js";
-import { ArtifactResourceScope } from "../../artifacts/ArtifactResourceScope.js";
-import { ArtifactReaderFailure } from "../../artifacts/ArtifactReader.js";
-import { bindRegularFileCleanup } from "../RegularFileRead.js";
+import {
+  ArtifactResourceScope,
+  ArtifactReaderFailure,
+} from "../../resources/index.js";
+import { bindRegularFileCleanup } from "../../process/RegularFileRead.js";
 import {
   writeAnalysisSnapshot as writeSnapshotFile,
   readAnalysisSnapshot as readSnapshotFile,
@@ -257,9 +259,9 @@ export abstract class BinarySessionRecords {
       target,
       profile,
       target === undefined
-        ? this.#records.exportEvidenceBundle()
+        ? this.#records.immutableEvidenceBundle()
         : evidenceBundleForTarget(
-            this.#records.exportEvidenceBundle(),
+            this.#records.immutableEvidenceBundle(),
             target.sha256,
           ),
     );
@@ -342,6 +344,15 @@ export abstract class BinarySessionRecords {
     return this.#snapshot.lookup(target, profile, operation, parameters, (id) =>
       this.evidenceForAnalysis(id),
     );
+  }
+
+  /** Why recording this execution would keep no replay entry, if anything. */
+  protected snapshotRecordingRefusal(
+    input: Parameters<AnalysisSnapshotCache["recordingRefusal"]>[0],
+  ): string | undefined {
+    return this.#snapshotInvalidated
+      ? "a metadata write in this session invalidated its snapshot"
+      : this.#snapshot.recordingRefusal(input);
   }
 
   protected recordSnapshot(

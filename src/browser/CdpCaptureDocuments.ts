@@ -1,14 +1,12 @@
-import type { InspectWebPageInput } from "../domain/browserObservation.js";
 import { sanitizeBrowserUrl } from "../domain/browserObservation.js";
 import type { WebPageInspection } from "../domain/browserObservationSchemas.js";
 import type { CdpFrameTree, CdpResourceTree } from "./protocol/CdpFrameTree.js";
+import type { CdpCommandResult } from "./protocol/CdpCommands.js";
 import {
   allowedSanitizedUrl,
-  admitRecords,
   numberValue,
   recordValue,
   recordsValue,
-  requiredRecord,
   cdpStringValue,
   type UnknownRecord,
 } from "./CdpCaptureValues.js";
@@ -147,14 +145,6 @@ export const classifyCdpFrameUrl = (
   };
 };
 
-/** Read the complete identity only when the protocol established it. */
-export const cdpFrameUrl = (
-  frame: UnknownRecord | undefined,
-): string | undefined => {
-  const observed = observeCdpFrameUrl(frame);
-  return observed.kind === "observed" ? observed.url : undefined;
-};
-
 /** Normalize every allowed resource. */
 export const captureResources = (
   tree: CdpResourceTree,
@@ -210,6 +200,17 @@ export interface DomCapture extends DomMetadataCapture {
   readonly nodes: WebPageInspection["dom"]["nodes"];
 }
 
+/** The DOM section of a snapshot whose reply was malformed: nothing was admitted. */
+export const emptyDomCapture: DomCapture = {
+  total: 0,
+  nodeValueLengthUnit: "utf16-code-units",
+  nodes: [],
+  urls: [],
+  agentHints: [],
+  excludedUrls: 0,
+  unresolvedSvgNodes: 0,
+};
+
 // Bound retained projections and outstanding CDP reads independently of page size.
 // Eight leaves room for the session's other cancellation listeners.
 const DOM_METADATA_BATCH_SIZE = 8;
@@ -222,27 +223,21 @@ interface PendingDomMetadata {
 
 /** Project one snapshot, requesting bounded batches of SVG identity facts. */
 export function* captureDom(
-  result: unknown,
+  root: CdpCommandResult<"DOMSnapshot.captureSnapshot">,
   allowedOrigins: ReadonlySet<string>,
-  input: InspectWebPageInput,
   completeness?: CdpCaptureCompleteness,
 ): Generator<
   readonly DomSvgNodeQuery[],
   DomCapture,
   readonly (boolean | undefined)[]
 > {
-  const root = requiredRecord(result);
-  const strings = Array.isArray(root.strings)
-    ? root.strings.map(cdpStringValue)
-    : [];
+  const strings = root.strings.map(cdpStringValue);
   const nodes: WebPageInspection["dom"]["nodes"] = [];
   const urls: WebPageInspection["metadata"]["dom_urls"] = [];
   const agentHints: WebPageInspection["metadata"]["agent_hints"] = [];
   let excludedUrls = 0;
   let total = 0;
   let unresolvedSvgNodes = 0;
-  if (!Array.isArray(root.strings))
-    excludeDocumentEvidence(completeness, "invalid_protocol_value", null);
   for (const document of snapshotDocuments(root.documents, (count) =>
     excludeDocumentEvidence(completeness, "invalid_protocol_value", count),
   )) {
@@ -289,17 +284,28 @@ export function* captureDom(
       const { nodeType, nodeName, nodeValue, parent, attributes } =
         admitted.value;
       const nodeIndex = baseIndex + index;
-      const attributeNames = [...new Set(attributes.map(([name]) => name))];
+      let attributeSet: Set<string> | undefined;
+      let attributeNames: string[];
+      if (attributes.length === 0) {
+        attributeNames = [];
+      } else {
+        attributeSet = new Set<string>();
+        for (let a = 0; a < attributes.length; a += 1) {
+          attributeSet.add(attributes[a]![0]);
+        }
+        attributeNames = [...attributeSet];
+      }
       const domElement = domXmlElement(ancestry, index);
       const htmlTagName = domHtmlTagName(nodeName, domElement);
       if (domElement.xmlDocument === undefined)
         completeness?.exclude("metadata", "invalid_protocol_value");
       let svgQuery: DomSvgNodeQuery | null | undefined;
       if (
+        attributeSet !== undefined &&
         domElement.xmlDocument === false &&
         nodeType === 1 &&
-        attributeNames.includes("xlink:href") &&
-        !attributeNames.includes("href")
+        attributeSet.has("xlink:href") &&
+        !attributeSet.has("href")
       ) {
         const backendNodeId = backendNodeIds[index];
         svgQuery =
@@ -362,7 +368,7 @@ export function* captureDom(
 }
 
 /** Skipped document facts also make their derived URL and hint inventory incomplete. */
-const excludeDocumentEvidence = (
+export const excludeDocumentEvidence = (
   completeness: CdpCaptureCompleteness | undefined,
   reason: BrowserExclusionReason,
   count: number | null = 1,
@@ -371,24 +377,16 @@ const excludeDocumentEvidence = (
   completeness?.exclude("metadata", reason, count);
 };
 
-/**
- * Read DOMSnapshot documents. A snapshot always describes at least one
- * document, so a missing or empty list is invalid rather than an empty DOM.
- */
+/** Admit DOMSnapshot documents one by one, counting each unusable entry. */
 export const snapshotDocuments = (
-  value: unknown,
-  onInvalid: (count: number | null) => void,
-): readonly UnknownRecord[] => {
-  if (!Array.isArray(value) || value.length === 0) {
-    onInvalid(null);
-    return [];
-  }
-  return value.flatMap((item) => {
+  values: CdpCommandResult<"DOMSnapshot.captureSnapshot">["documents"],
+  onInvalid: (count: number) => void,
+): readonly UnknownRecord[] =>
+  values.flatMap((item) => {
     const document = recordValue(item);
     if (document === undefined) onInvalid(1);
     return document === undefined ? [] : [document];
   });
-};
 
 function* captureDomMetadata(
   pending: readonly PendingDomMetadata[],
@@ -436,7 +434,7 @@ function* captureDomMetadata(
 }
 
 export const captureAccessibility = (
-  results: readonly unknown[],
+  results: readonly CdpCommandResult<"Accessibility.getFullAXTree">[],
   options: {
     readonly includeText: boolean;
     readonly unavailable?: boolean;
@@ -448,16 +446,7 @@ export const captureAccessibility = (
   readonly textCapture: WebPageInspection["accessibility"]["text_capture"];
   readonly hasUnobservedChildren: boolean;
 } => {
-  const all = results.flatMap((result) => {
-    const inventory = admitRecords(requiredRecord(result).nodes);
-    if (inventory === undefined) {
-      options.completeness?.exclude(
-        "accessibility",
-        "invalid_protocol_value",
-        null,
-      );
-      return [];
-    }
+  const all = results.flatMap(({ nodes: inventory }) => {
     const nodes: {
       readonly nodeId: string;
       readonly parentId: string | null;

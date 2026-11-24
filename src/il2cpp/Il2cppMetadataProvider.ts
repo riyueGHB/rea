@@ -2,7 +2,14 @@ import { IL2CPP_METADATA_PROVIDER_IDENTITY } from "./Il2CppMetadataProviderIdent
 import {
   Il2cppBinaryFormatFailure,
   IL2CPP_BINARY_BYTES,
+  IL2CPP_BINARY_FORMAT,
+  isIl2cppLinkConflict,
 } from "./Il2cppBinaryFormat.js";
+import {
+  isParseLimit,
+  parseFailureAnalysisError,
+  parseLimitConstraint,
+} from "../domain/parseFailureAnalysisError.js";
 import { Il2cppMetadataFormatFailure } from "./Il2cppMetadataFormat.js";
 import { inspectIl2cppMetadataV108 } from "./Il2cppMetadataV108.js";
 import type { AnalysisPartialObservation } from "../domain/analysisErrorBase.js";
@@ -11,24 +18,20 @@ import { setImmediate } from "node:timers/promises";
 import {
   readStableArtifact,
   type StableArtifactSnapshot,
-} from "../artifacts/readStableArtifact.js";
-import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
-import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
-import {
+  ArtifactResourceScope,
+  ArtifactReaderFailure,
   projectOwnedArtifactIdentityFailure,
   projectSelectedArtifactFileFailure,
   stableArtifactInputFailure,
-} from "../artifacts/StableArtifactFailure.js";
-import {
   artifactFilePrimaryFacts,
   type ArtifactFilePrimaryFacts,
   artifactFileCompletion,
   bindArtifactFileCleanup,
   assertArtifactReadActive,
-} from "../artifacts/ArtifactFileOperation.js";
+} from "../resources/index.js";
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
-import type { ExecutionOptions } from "../application/AnalysisProvider.js";
-import type { Il2cppMetadataPort } from "../application/il2cpp/Il2cppMetadataPort.js";
+import type { ExecutionOptions } from "../ports/AnalysisProvider.js";
+import type { Il2cppMetadataPort } from "../ports/il2cpp/Il2cppMetadataPort.js";
 import { AnalysisError } from "../domain/analysisErrorBase.js";
 import { createEvidence } from "../domain/evidence.js";
 import { createIl2cppMetadataAdmission } from "./Il2cppMetadataAdmission.js";
@@ -47,9 +50,11 @@ import {
 } from "../domain/analysisErrorCore.js";
 import {
   il2cppMetadataSchema,
+  il2cppNativeIndexLimit,
   type Il2cppMetadata,
   type Il2cppMetadataProviderInput,
 } from "../domain/il2cpp/il2cppMetadata.js";
+import { ELF_VIRTUAL_POINTER_INDEX_LIMIT } from "../domain/native/elfPointerRelocations.js";
 import { fixedAllowanceOptions } from "../domain/fixedAllowanceRemediation.js";
 import { ProviderAdapterError } from "../domain/providerAdapterError.js";
 import { ProviderCleanupError } from "../domain/providerCleanupError.js";
@@ -60,9 +65,10 @@ import {
   type Il2cppMetadataRowCounts,
 } from "./Il2cppMetadataFile.js";
 import {
-  linkIl2cppBinarySteps,
+  linkIl2cppBinaryCooperative,
   type Il2cppBinaryLink,
 } from "./Il2cppBinaryFile.js";
+import { errorMessage } from "../kernel/errorMessage.js";
 
 const OPERATION = "inspect_il2cpp_metadata";
 const INPUT_BYTES = 256 * 1024 * 1024;
@@ -73,6 +79,39 @@ const inferredReferenceForm = (architecture: string) =>
   architecture === "arm64"
     ? "an adjacent ADRP+ADD pair"
     : "RIP-relative LEA/MOV";
+/**
+ * Both files parsed, but the binary does not link to the metadata. They are
+ * two well-formed records that disagree, and nothing establishes which one
+ * is wrong, so neither is called malformed: the refusal lists both selecting
+ * fields, and the caller's partial observation keeps both files' identities.
+ */
+const linkConflict = (
+  binaryPath: string,
+  metadataPath: string,
+  cause: Il2cppBinaryFormatFailure,
+): AnalysisInputError =>
+  new AnalysisInputError(
+    OPERATION,
+    {
+      cause,
+      conformsToInputContract: true,
+      remediationAction:
+        "Select the native binary and global-metadata.dat from the same build. If they are from the same build, either file may be damaged or the binary's registration layout may be outside coverage. Without the binary, the metadata alone can still be read.",
+    },
+    [
+      {
+        path: ["path"],
+        reason: "invalid_value",
+        message: `Selected metadata ${metadataPath} does not link to the selected binary: ${cause.message}`,
+      },
+      {
+        path: ["binary_path"],
+        reason: "invalid_value",
+        message: `Selected binary ${binaryPath} does not link to the metadata: ${cause.message}`,
+      },
+    ],
+  );
+
 const failureForPrimary = (
   facts: ArtifactFilePrimaryFacts,
   path: string,
@@ -83,42 +122,50 @@ const failureForPrimary = (
   const { cause, origin } = facts;
   if (origin === "owned-or-classified" && cause instanceof AnalysisError)
     return cause;
-  if (cause instanceof Il2cppBinaryFormatFailure && cause.kind === "limit")
-    return new AnalysisResourceConstraintError(
+  if (
+    cause instanceof Il2cppBinaryFormatFailure &&
+    isParseLimit(cause, IL2CPP_BINARY_FORMAT) &&
+    cause.failure.limit.name === ELF_VIRTUAL_POINTER_INDEX_LIMIT
+  ) {
+    const selected = cause.failure.limit.maximum;
+    return parseLimitConstraint(OPERATION, "memory", cause, {
+      retryable: false,
+      limit: il2cppNativeIndexLimit(selected),
+      remediationAction: `The ELF pointer index allowance is max_native_index_bytes = ${String(selected)} bytes. Pass a larger max_native_index_bytes (up to ${String(Number.MAX_SAFE_INTEGER)}) on the next ${OPERATION} call with the same binary_path; no restart is required. Host memory and the binary file allowance are independent. Repeating the unchanged request fails the same way.`,
+    });
+  }
+  if (
+    cause instanceof Il2cppBinaryFormatFailure &&
+    isParseLimit(cause, IL2CPP_BINARY_FORMAT)
+  )
+    return parseLimitConstraint(
       OPERATION,
       cause.reason === "native-type-text-capacity" ? "memory" : "capacity",
-      cause.message,
-      {},
-      {
-        cause,
-        ...fixedAllowanceOptions(
-          "The IL2CPP native-link allowance",
-          cause.reason === "native-type-text-capacity" ? "parser" : "count",
-        ),
-      },
+      cause,
+      fixedAllowanceOptions(
+        "The IL2CPP native-link allowance",
+        cause.reason === "native-type-text-capacity" ? "parser" : "count",
+        {
+          limit: cause.failure.limit.maximum,
+          ...(cause.unit === undefined ? {} : { unit: cause.unit }),
+        },
+      ),
     );
   if (
-    cause instanceof Il2cppBinaryFormatFailure ||
-    cause instanceof Il2cppMetadataFormatFailure
-  ) {
-    const binary = cause instanceof Il2cppBinaryFormatFailure;
-    // Metadata names are read on demand while linking, so a metadata failure
-    // can surface while path still names the binary.
-    const target = binary ? path : metadataPath;
-    return cause.kind === "unsupported"
-      ? new AnalysisUnsupportedTargetError(OPERATION, target, cause.message, {
-          cause,
-        })
-      : new AnalysisInputError(OPERATION, { cause }, [
-          {
-            path: [binary ? field : "path"],
-            reason: "invalid_format",
-            message: binary
-              ? `Selected binary ${target} does not link to the metadata: ${cause.message}`
-              : `Selected artifact ${target} is corrupt: ${cause.message}`,
-          },
-        ]);
-  }
+    cause instanceof Il2cppBinaryFormatFailure &&
+    isIl2cppLinkConflict(cause.reason)
+  )
+    return linkConflict(path, metadataPath, cause);
+  // Each file's own format failure names that file. Metadata names are read
+  // on demand while linking, so a metadata failure can surface while `path`
+  // here still names the binary.
+  const ownFormatFailure =
+    cause instanceof Il2cppBinaryFormatFailure
+      ? parseFailureAnalysisError(OPERATION, path, cause)
+      : cause instanceof Il2cppMetadataFormatFailure
+        ? parseFailureAnalysisError(OPERATION, metadataPath, cause)
+        : undefined;
+  if (ownFormatFailure !== undefined) return ownFormatFailure;
   const identityFailure = projectOwnedArtifactIdentityFailure(
     facts,
     OPERATION,
@@ -137,7 +184,14 @@ const failureForPrimary = (
         { maximum_input_bytes: maximum },
         {
           cause,
-          ...fixedAllowanceOptions("the fixed IL2CPP input allowance", "input"),
+          ...fixedAllowanceOptions(
+            "the fixed IL2CPP input allowance",
+            "input",
+            {
+              limit: maximum,
+              unit: "bytes",
+            },
+          ),
         },
       );
     if (cause.reason === "path")
@@ -158,7 +212,7 @@ const failureForPrimary = (
       cause,
       diagnostics: {
         path,
-        reason: cause instanceof Error ? cause.message : String(cause),
+        reason: errorMessage(cause),
       },
     },
   );
@@ -551,22 +605,23 @@ export class Il2cppMetadataProvider implements Il2cppMetadataPort {
               input.binary_architecture,
             );
             sliceLimitations = selected.limitations;
-            const linking = linkIl2cppBinarySteps(
+            const linking = await linkIl2cppBinaryCooperative(
               selected.bytes,
               decoded,
               link,
               {
                 ...admission,
                 genericInstances: input.generic_instances === true,
+                ...(input.max_native_index_bytes === undefined
+                  ? {}
+                  : { maxNativeIndexBytes: input.max_native_index_bytes }),
+              },
+              async () => {
+                await this.yieldControl();
+                assertArtifactReadActive(options?.signal);
               },
             );
-            let linkStep = linking.next();
-            while (!linkStep.done) {
-              await this.yieldControl();
-              assertArtifactReadActive(options?.signal);
-              linkStep = linking.next();
-            }
-            linked = binaryReport(linkStep.value, {
+            linked = binaryReport(linking, {
               path: binaryPath,
               sha256: binary.sha256,
               bytes: binary.bytes.length,
@@ -597,6 +652,11 @@ export class Il2cppMetadataProvider implements Il2cppMetadataPort {
             binaryPath === undefined
               ? "Native code addresses and IL2CPP binary registration are not recovered without binary_path."
               : `Method addresses come from the binary's code-generation module methodPointers, matched by module name, method count and metadata token; ${input.generic_instances === true ? "" : "generic method instances (see generic_instances), "}adjustor thunks and invokers are not linked, no-body means an observed zero slot, and unknown means no module claimed the method or its slot has an unresolved relocation.`,
+            ...(linked.binary?.format === "elf"
+              ? [
+                  "ELF symbolic pointers use the selected file's defined symbols to derive link-image addresses; runtime symbol interposition, external definitions, TLS addresses and IFUNC results are not established.",
+                ]
+              : []),
             ...(binaryPath !== undefined && input.generic_instances === true
               ? [
                   "Generic method instances come from genericMethodTable, methodSpecs, genericInsts and genericMethodPointers, with names following Il2CppDumper's GetMethodSpecName (namespace on the declaring type, nested types joined with '.', arity cut, IntPtr/UIntPtr, no byref mark). The CodeRegistration layout is the only one of the known 27.0 to 31 layouts whose counts bound every genericMethodTable row; metadata versions 24 and 39 and builds without a static CodeRegistration are refused. A generic row is no-body for an observed zero pointer slot and unknown, with no address, exactly when an issue names its row: a contradicting method spec (its name is then null), a shared method spec, an unmapped or non-executable pointer, or an unresolved relocation.",
