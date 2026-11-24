@@ -9,7 +9,6 @@ on:
 permissions:
   contents: write
 
-# 同一时间只允许一个同步任务，避免两次改动互相打架
 concurrency:
   group: ultimate-safe-sync
   cancel-in-progress: false
@@ -17,25 +16,40 @@ concurrency:
 jobs:
   sync-all:
     runs-on: ubuntu-latest
-    env:
-      # ⚠️ 唯一需要改的地方：改成这个仓库对应的源仓库
-      UPSTREAM: "morluto/rea"
     steps:
-      - name: Checkout backup repo
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # fork 仓库会自动识别上游，不用改这里；
+          # 本地上传的独立仓库请把下面引号里的地址改成源仓库（只改这一行）
+          FALLBACK_UPSTREAM="morluto/rea"
+
+          UPSTREAM=$(gh api "repos/${{ github.repository }}" --jq '.parent.full_name' 2>/dev/null || true)
+          if [ -z "$UPSTREAM" ] || [ "$UPSTREAM" = "null" ]; then
+            UPSTREAM="$FALLBACK_UPSTREAM"
+          fi
+          if [ -z "$UPSTREAM" ] || [ "$UPSTREAM" = "<owner>/<repo>" ]; then
+            echo "::warning::这不是 fork 仓库，也没有设置 FALLBACK_UPSTREAM，跳过。"
+            exit 0
+          fi
+          echo "UPSTREAM=$UPSTREAM" >> "$GITHUB_ENV"
+          echo "同步上游：$UPSTREAM"
 
       - name: Safe Sync Code, Tags and Snapshots
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -z "$UPSTREAM" ]; then echo "没有可用的上游，跳过同步。"; exit 0; fi
           SYNC_FILE=".github/workflows/sync-all.yml"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 独立仓库没有 parent，UPSTREAM 直接用手写的值
           git remote remove upstream 2>/dev/null || true
           git remote add upstream "https://github.com/$UPSTREAM.git"
           git fetch upstream --tags --prune --force
@@ -57,7 +71,7 @@ jobs:
               if git show-ref --verify --quiet "refs/heads/$branch"; then
                 git checkout "$branch"
                 OLD_HEAD=$(git rev-parse HEAD)
-                # 有共同历史 -> 普通合并；无共同历史（打包上传/网页新建的仓库）-> 镜像重置，并保住本工作流
+                # 有共同历史 -> 普通合并；无共同历史（打包上传/上游 force push）-> 镜像重置，并保住本工作流
                 if [ -n "$(git merge-base HEAD "upstream/$branch" 2>/dev/null)" ]; then
                   if ! git merge "upstream/$branch" --no-edit -m "Sync with upstream $branch" >/dev/null 2>&1; then
                     # 上游改了我们已删除的 workflow 时会冲突；只要冲突全在 .github/workflows/，
@@ -80,7 +94,7 @@ jobs:
                   done
                   git diff --cached --quiet || git commit --amend --no-edit --quiet
                 else
-                  echo "检测到无关历史（打包上传的仓库），按镜像方式重置 $branch"
+                  echo "历史与上游不相关，按镜像方式重置 $branch"
                   cp "$SYNC_FILE" /tmp/sync-all.yml 2>/dev/null || true
                   git reset --hard "upstream/$branch"
                   mkdir -p .github/workflows
@@ -126,6 +140,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -z "$UPSTREAM" ]; then echo "没有可用的上游，跳过 Release 同步。"; exit 0; fi
           curl -s "https://api.github.com/repos/$UPSTREAM/releases?per_page=30" > releases.json
           if ! grep -q "tag_name" releases.json; then
             echo "未找到公开的 Release。"
@@ -138,7 +153,6 @@ jobs:
               echo "Release $TAG 已存在。"
             else
               mkdir -p ./assets
-              # 完美还原标题
               NAME=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .name // empty" releases.json)
               BODY=$(jq -r ".[] | select(.tag_name == \"$TAG\") | .body // empty" releases.json)
               if [ -z "$NAME" ]; then TITLE="$TAG"; else TITLE="$NAME"; fi
@@ -159,7 +173,6 @@ jobs:
             fi
           done
 
-          # 清理多余的 Release（保留最新 30 个）
           MY_TAGS=$(gh release list --repo ${{ github.repository }} --limit 100 --json tagName --jq '.[].tagName' 2>/dev/null || true)
           if [ -n "$MY_TAGS" ]; then
             COUNT=$(echo "$MY_TAGS" | grep -c . || true)
