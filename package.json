@@ -402,7 +402,7 @@
     "ignore": "7.0.16",
     "isomorphic-git": "1.44.17",
     "jsonc-parser": "3.3.1",
-    "lossless-json": "4.3.3",
+    "lossless-json": "4.3.4",
     "lzma-purejs": "0.9.3",
     "openpgp": "6.3.2",
     "parse5": "8.1.1",
@@ -414,7 +414,7 @@
     "smol-toml": "1.9.1",
     "stream-chain": "4.4.2",
     "stream-json": "3.9.0",
-    "tokenx": "2.2.0",
+    "tokenx": "2.2.1",
     "write-file-atomic": "8.0.0",
     "ws": "8.23.0",
     "yaml": "2.9.1",
@@ -445,7 +445,7 @@
     "@vitest/coverage-v8": "5.1.1",
     "husky": "9.1.7",
     "jscpd": "5.4.3",
-    "knip": "6.45.1",
+    "knip": "6.46.1",
     "lint-staged": "17.6.1",
     "markdown-it": "15.0.3",
     "oxfmt": "0.79.0",
@@ -455,7 +455,7 @@
     "rolldown": "1.3.3",
     "tsrs": "7.1.0-beta.tsrs2",
     "tsx": "4.23.15",
-    "turbo": "2.11.12",
+    "turbo": "2.11.13",
     "typescript": "7.0.2",
     "typescript-termux": "npm:typescript@5.9.3",
     "typescript6": "npm:typescript@6.0.3",
@@ -463,7 +463,7 @@
     "vitest": "5.1.1"
   },
   "optionalDependencies": {
-    "frida": "17.23.2"
+    "frida": "17.27.0"
   },
   "allowScripts": {
     "frida@17.23.2": true
