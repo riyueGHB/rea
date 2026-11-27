@@ -417,7 +417,7 @@
     "smol-toml": "1.9.1",
     "stream-chain": "4.4.2",
     "stream-json": "3.9.0",
-    "tokenx": "2.2.0",
+    "tokenx": "2.2.1",
     "write-file-atomic": "8.0.0",
     "ws": "8.23.0",
     "yaml": "2.9.1",
@@ -466,7 +466,7 @@
     "vitest": "5.1.1"
   },
   "optionalDependencies": {
-    "frida": "17.23.2"
+    "frida": "17.27.4"
   },
   "allowScripts": {
     "frida@17.23.2": true
