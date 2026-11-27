@@ -409,13 +409,13 @@
     "parse5": "8.1.1",
     "pino": "10.4.0",
     "playwright-core": "1.65.1",
-    "plist": "5.1.1",
+    "plist": "5.1.2",
     "saxes": "6.0.0",
     "semver": "7.8.6",
     "smol-toml": "1.9.1",
     "stream-chain": "4.4.2",
     "stream-json": "3.9.0",
-    "tokenx": "2.2.0",
+    "tokenx": "2.2.1",
     "write-file-atomic": "8.0.0",
     "ws": "8.23.0",
     "yaml": "2.9.1",
@@ -464,7 +464,7 @@
     "vitest": "5.1.1"
   },
   "optionalDependencies": {
-    "frida": "17.23.2"
+    "frida": "17.27.2"
   },
   "allowScripts": {
     "frida@17.23.2": true
